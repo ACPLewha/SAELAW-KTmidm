@@ -1,32 +1,86 @@
-import openai
 import pandas as pd
+import torch
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
-openai.api_key = "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"
+data6 = pd.read_csv("pre_test.csv")
 
-engine = "gpt-3.5-turbo"
-temperature = 0.7
-max_tokens = 1000
-stop_sequence = "\n"
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-def summarize_and_simplify(text):
+import torch
+from konlpy.tag import Okt
+from transformers import BertForSequenceClassification, BertTokenizer
+from heapq import nlargest
 
-    prompt = f"Summarize this legal provision into a shorter sentence and explain it in simple words for better understanding: \"{text}\""
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
+
+gpt2_tokenizer = GPT2Tokenizer.from_pretrained("distilgpt2")
+gpt2_model = GPT2LMHeadModel.from_pretrained("distilgpt2")
+gpt2_model.eval()
+
+def rephrase_gpt2(tokenizer, model, summarized_text, max_length=200):
+    prompt = f"Please rephrase this legal terminology into a simple sentence that retains the original meaning but is easy for a child to understand: {summarized_text}"
+    input_ids = tokenizer.encode(prompt, return_tensors="pt")
     
-    response = openai.ChatCompletion.create(
-        engine=engine,
-        messages=[{"role": "user", "content": f"Summarize this legal provision into a shorter sentence and explain it in simple words for better understanding in korean: \"{text}\""}],
-        temperature=temperature,
-        max_tokens=max_tokens,
-        stop=stop_sequence
-    )
+    output = model.generate(input_ids, max_length=max_length, num_return_sequences=1,
+                            no_repeat_ngram_size=2, early_stopping=True)
+    
+    rephrased_text = tokenizer.decode(output[0], skip_special_tokens=True)
+    return rephrased_text
 
 
-    summary = response.choices[0].text.strip()
-    return summary
+def get_kobert_model():
+    tokenizer = BertTokenizer.from_pretrained("beomi/kcbert-base")
+    model = BertForSequenceClassification.from_pretrained("beomi/kcbert-base", num_labels=2)
+    model.eval()
+    
+    return tokenizer, model
 
-input_file_path = 'pre_test.csv'
-df = pd.read_csv(input_file_path)
-df['Summary_and_simplify'] = df.iloc[:, 0].apply(summarize_and_simplify)
+def tokenize_sentences(tokenizer, sentences):
+    encoded_input = tokenizer(sentences, return_tensors='pt', padding=True,
+                                truncation=True, max_length=200)
+    return encoded_input
 
-output_file_path = 'api_pretest.csv'
-df.to_csv(output_file_path, index=False)
+def kobert_summarize(tokenizer, model, text, top_n=3):
+    okt = Okt()
+    sentences = text.split(". ")
+    
+    sentences_with_token = okt.pos(text)
+    words = [word for word, _ in sentences_with_token]
+    unique_words = list(set(words))
+
+    tokenized_sentences = tokenize_sentences(tokenizer, unique_words)
+
+    with torch.no_grad():
+        outputs = model(**tokenized_sentences).logits
+    
+    outputs = torch.nn.functional.softmax(outputs, dim=1)
+    relevance_scores = {w: outputs[i][1].item() for i, w in enumerate(unique_words)}
+
+    sentence_scores = {}
+    for s in sentences:
+        tokenized_sentence = okt.pos(s)
+        sentence_scores[s] = sum([relevance_scores[word] for word in tokenized_sentence if word in relevance_scores])
+
+    summarized_sentences = nlargest(top_n, sentence_scores, key=sentence_scores.get)
+    
+    return ". ".join(sorted(summarized_sentences, key=text.find))
+
+
+def process(data):
+    kobert_tokenizer, kobert_model = get_kobert_model()
+    rephrased_result = []
+    
+    for index, row in data.iterrows():
+        original_text = row["summary"]
+        if pd.isna(original_text): 
+            rephrased_result.append(None)
+        else:
+            summarized_text = kobert_summarize(kobert_tokenizer, kobert_model, str(original_text))
+            rephrased_text = rephrase_gpt2(gpt2_tokenizer, gpt2_model, summarized_text)
+            rephrased_result.append(rephrased_text)  
+        
+        print("rephrased_text", rephrased_text)
+        
+    return rephrased_result
+
+
